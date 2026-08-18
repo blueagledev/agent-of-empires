@@ -235,24 +235,22 @@ fn claude_pane_has_running_signal(
 /// The background-agents strip below the input footer renders unparenthesized
 /// counters (`1m 14s · ↓ 40.4k tokens`) and stays on screen, frozen at its
 /// final values, after the agent completes and the session is fully idle.
-/// Matching it would pin a parked session on Running (the bug #2909 fixed),
-/// so two structural requirements exclude it: the count must be a plain
-/// integer (no `40.4k` decimal/suffix forms) and `tokens` must be followed by
-/// the counter's closing paren, which strip rows never have.
+/// Matching it would pin a parked session on Running (the bug #2909 fixed).
+/// The closing paren after `tokens` is what excludes it, and it is the whole
+/// guard: strip rows never carry one.
+///
+/// The count itself must NOT be restricted to a plain integer. The suffix form
+/// is not exclusive to the strip: `(22m 8s · ↓ 44.7k tokens)` was captured
+/// from a live counter, parens and all, so an integer-only match stopped
+/// seeing the counter as soon as a turn ran long enough to be abbreviated.
+/// `m` is accepted on the same footing as `k`; only `k` has been observed.
 fn has_claude_live_token_counter(content: &str) -> bool {
     let mut search = content;
     while let Some(pos) = search.find("s · ↓") {
         let after = search[pos + "s · ↓".len()..].trim_start();
-        let mut digits_end = 0;
-        for (i, c) in after.char_indices() {
-            if c.is_ascii_digit() {
-                digits_end = i + c.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if digits_end > 0 {
-            let tail = after[digits_end..].trim_start();
+        let count_end = claude_token_count_end(after);
+        if count_end > 0 {
+            let tail = after[count_end..].trim_start();
             if let Some(after_tokens) = tail.strip_prefix("tokens") {
                 if after_tokens.trim_start().starts_with(')') {
                     return true;
@@ -265,13 +263,46 @@ fn has_claude_live_token_counter(content: &str) -> bool {
     false
 }
 
-/// Match the `<frame> <Verb…>` shape on a single pane line. The ellipsis must
-/// be inside the first or second word after the frame char: single-verb lines
-/// end it on word one (`Working…`), and compaction ends it on word two
-/// (`✢ Compacting conversation… (17s)`, captured from 2.1.211). Later words
-/// don't count, so past-tense completions (`Worked for 1m 52s`, no `…`) and
-/// rendered markdown bullets (`* Cooked an amazing dish today…`, `…` several
-/// words in) stay rejected.
+/// Byte length of the token count at the start of `s`, or 0 if there isn't
+/// one: digits, then an optional decimal fraction and an optional `k`/`m`
+/// magnitude suffix (`88`, `44.7k`, `1.2m`). Only ASCII is consumed, so the
+/// returned index is always a char boundary.
+fn claude_token_count_end(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return 0;
+    }
+    if i < b.len() && b[i] == b'.' {
+        let mut j = i + 1;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > i + 1 {
+            i = j;
+        }
+    }
+    if i < b.len() && matches!(b[i], b'k' | b'K' | b'm' | b'M') {
+        i += 1;
+    }
+    i
+}
+
+/// Match the `<frame> <Verb…>` shape on a single pane line. The ellipsis
+/// normally sits in the first or second word after the frame char: single-verb
+/// lines end it on word one (`Working…`), and compaction ends it on word two
+/// (`✢ Compacting conversation… (17s)`, captured from 2.1.211).
+///
+/// A status phrase can run longer than that (`✻ Judging #3413 feedback… (22m 8s
+/// · ↓ 44.7k tokens)`), so a third acceptance path takes the ellipsis anywhere
+/// in the phrase, but only when the live elapsed-time group follows it. That
+/// group is what keeps the rejections the two-word window bought: past-tense
+/// completions (`Worked for 1m 52s`) carry no `…`, and a rendered markdown
+/// bullet that ends in one (`* Cooked an amazing dish today…`) is not followed
+/// by `(<digit>`.
 fn claude_line_is_active_spinner(line: &str) -> bool {
     let trimmed = line.trim_start();
     let mut chars = trimmed.chars();
@@ -293,7 +324,24 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
     if !first_word.chars().next().is_some_and(|c| c.is_uppercase()) {
         return false;
     }
-    first_word.contains('…') || words.next().is_some_and(|w| w.contains('…'))
+    if first_word.contains('…') || words.next().is_some_and(|w| w.contains('…')) {
+        return true;
+    }
+    claude_phrase_precedes_elapsed_group(rest)
+}
+
+/// The `<phrase…> (<digit>` shape: an ellipsis somewhere in the status phrase,
+/// then the parenthesised live group Claude renders after it, which always
+/// opens on the elapsed time (`(17s)`, `(22m 8s · ↓ 44.7k tokens)`).
+fn claude_phrase_precedes_elapsed_group(rest: &str) -> bool {
+    let Some(paren) = rest.find('(') else {
+        return false;
+    };
+    rest[..paren].contains('…')
+        && rest[paren + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Match the parked background-agent wait line: `✻ Waiting for 1 background
@@ -2338,6 +2386,80 @@ enter to select · esc to cancel";
             detect_claude_status("Generating...\nctrl+c to interrupt"),
             Status::Running
         );
+    }
+
+    /// Verbatim `tmux capture-pane -p` of a live aoe session mid-turn,
+    /// 2026-08-18, trimmed to the tail of the recent window. `aoe` showed this
+    /// session as `Idle` while it was actively generating: the status phrase
+    /// runs to three words so the ellipsis lands past the old two-word window,
+    /// and the token count carries the `k` suffix the old integer-only match
+    /// rejected. The `esc to interrupt` hint that normally covers for both is
+    /// absent because Claude renders `ctrl+b to run in background` instead
+    /// while a backgroundable tool call is in flight.
+    const CLAUDE_MULTI_WORD_SPINNER_PANE: &str = "\
+  Clippy clean on both; check-skill passed. Waiting on the base-commit control.
+  Ran 2 shell commands
+\u{273b} Judging #3413 feedback\u{2026} (22m 8s \u{b7} \u{2193} 44.7k tokens)
+\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+\u{276f}
+\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  \u{23f5}\u{23f5} auto mode on \u{b7} 2 shells \u{b7} \u{2190} for agents
+";
+
+    #[test]
+    fn claude_multi_word_spinner_phrase_is_running() {
+        assert_eq!(
+            detect_claude_status(CLAUDE_MULTI_WORD_SPINNER_PANE),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn claude_spinner_matches_ellipsis_past_the_second_word() {
+        assert!(claude_line_is_active_spinner(
+            "\u{273b} Judging #3413 feedback\u{2026} (22m 8s \u{b7} \u{2193} 44.7k tokens)"
+        ));
+        assert!(claude_line_is_active_spinner(
+            "\u{2722} Compacting conversation\u{2026} (17s)"
+        ));
+        assert!(claude_line_is_active_spinner("\u{2736} Working\u{2026}"));
+    }
+
+    /// The two-word window existed to reject prose; the elapsed-time group
+    /// that replaced it has to keep doing that.
+    #[test]
+    fn claude_spinner_still_rejects_prose_ending_in_an_ellipsis() {
+        assert!(!claude_line_is_active_spinner(
+            "* Cooked an amazing dish today\u{2026}"
+        ));
+        assert!(!claude_line_is_active_spinner(
+            "* Cooked an amazing dish today\u{2026} (a family recipe)"
+        ));
+        assert!(!claude_line_is_active_spinner("\u{2736} Worked for 1m 52s"));
+    }
+
+    #[test]
+    fn claude_token_counter_accepts_decimal_and_magnitude_suffixes() {
+        assert!(has_claude_live_token_counter(
+            "(22m 8s \u{b7} \u{2193} 44.7k tokens)"
+        ));
+        assert!(has_claude_live_token_counter(
+            "(4s \u{b7} \u{2193} 88 tokens)"
+        ));
+        // Defensive rather than observed: only the `k` form has been captured.
+        assert!(has_claude_live_token_counter(
+            "(3m 1s \u{b7} \u{2193} 1.2m tokens)"
+        ));
+    }
+
+    /// #2909: the frozen background-agents strip carries the same counter
+    /// shape without the closing paren, and must stay rejected now that the
+    /// count itself is no longer restricted to a plain integer.
+    #[test]
+    fn claude_token_counter_still_rejects_the_unparenthesized_agents_strip() {
+        assert!(!has_claude_live_token_counter(
+            "  \u{25ef} general-purpose  Summarize tmux module pub fns    1m 14s \u{b7} \u{2193} 40.4k tokens"
+        ));
     }
 
     #[test]
