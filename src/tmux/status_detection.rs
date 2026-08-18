@@ -235,7 +235,7 @@ fn claude_pane_has_running_signal(
 /// The background-agents strip below the input footer renders unparenthesized
 /// counters (`1m 14s · ↓ 40.4k tokens`) and stays on screen, frozen at its
 /// final values, after the agent completes and the session is fully idle.
-/// Matching it would pin a parked session on Running (the bug #2909 fixed).
+/// Matching it would pin a parked session on Running (the bug #2915 fixed).
 /// The closing paren after `tokens` is what excludes it, and it is the whole
 /// guard: strip rows never carry one.
 ///
@@ -298,11 +298,13 @@ fn claude_token_count_end(s: &str) -> usize {
 ///
 /// A status phrase can run longer than that (`✻ Judging #3413 feedback… (22m 8s
 /// · ↓ 44.7k tokens)`), so a third acceptance path takes the ellipsis anywhere
-/// in the phrase, but only when the live elapsed-time group follows it. That
-/// group is what keeps the rejections the two-word window bought: past-tense
-/// completions (`Worked for 1m 52s`) carry no `…`, and a rendered markdown
-/// bullet that ends in one (`* Cooked an amazing dish today…`) is not followed
-/// by `(<digit>`.
+/// in the phrase, but only when a parenthesised elapsed-duration group follows
+/// it. That group is what keeps the rejections the two-word window bought:
+/// past-tense completions (`Worked for 1m 52s`) carry no `…`, and a rendered
+/// markdown bullet that ends in one is not followed by a duration.
+///
+/// Note the third path needs the group; `✻ Working…` on its own still matches
+/// through the two-word path, which is why the group is not required there.
 fn claude_line_is_active_spinner(line: &str) -> bool {
     let trimmed = line.trim_start();
     let mut chars = trimmed.chars();
@@ -330,18 +332,39 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
     claude_phrase_precedes_elapsed_group(rest)
 }
 
-/// The `<phrase…> (<digit>` shape: an ellipsis somewhere in the status phrase,
-/// then the parenthesised live group Claude renders after it, which always
-/// opens on the elapsed time (`(17s)`, `(22m 8s · ↓ 44.7k tokens)`).
+/// The `<phrase…> (<elapsed>` shape: an ellipsis somewhere in the status
+/// phrase, then the live group Claude renders after it, which opens on an
+/// elapsed duration (`(17s)`, `(22m 8s · ↓ 44.7k tokens)`).
+///
+/// The *duration* is what carries the weight, not merely a leading digit. A
+/// parenthetical that opens on a bare number is ordinary prose — a rendered
+/// markdown bullet reads `* Wire the detector in… (2 call sites)`, and `*` and
+/// `●` are both frame chars — and matching it would pin a parked session on
+/// Running until the text scrolled out of the window, which is exactly the
+/// #2915 failure mode `reconcile_claude_idle_hook_status` exists to avoid.
+///
+/// The group is found with `rfind`, so a parenthetical inside the phrase
+/// (`✢ Compacting conversation (auto)… (17s)`) does not shadow it.
 fn claude_phrase_precedes_elapsed_group(rest: &str) -> bool {
-    let Some(paren) = rest.find('(') else {
+    let Some(paren) = rest.rfind('(') else {
         return false;
     };
-    rest[..paren].contains('…')
-        && rest[paren + 1..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit())
+    rest[..paren].contains('…') && claude_group_opens_on_duration(&rest[paren + 1..])
+}
+
+/// `17s`, `22m`, `1h`: digits, a time unit, then a non-alphanumeric boundary.
+/// `2 call sites`, `1 blocker`, `14:32` and `a family recipe` are not
+/// durations. Only ASCII is inspected, so every index is a char boundary.
+fn claude_group_opens_on_duration(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || !matches!(b.get(i), Some(b's' | b'm' | b'h')) {
+        return false;
+    }
+    b.get(i + 1).is_none_or(|c| !c.is_ascii_alphanumeric())
 }
 
 /// Match the parked background-agent wait line: `✻ Waiting for 1 background
@@ -2388,8 +2411,7 @@ enter to select · esc to cancel";
         );
     }
 
-    /// Verbatim `tmux capture-pane -p` of a live aoe session mid-turn,
-    /// 2026-08-18, trimmed to the tail of the recent window. `aoe` showed this
+    /// Reconstructed from a live aoe session mid-turn, 2026-08-18. `aoe` showed this
     /// session as `Idle` while it was actively generating: the status phrase
     /// runs to three words so the ellipsis lands past the old two-word window,
     /// and the token count carries the `k` suffix the old integer-only match
@@ -2425,21 +2447,62 @@ enter to select · esc to cancel";
         assert!(claude_line_is_active_spinner("\u{2736} Working\u{2026}"));
     }
 
-    /// The two-word window existed to reject prose; the elapsed-time group
-    /// that replaced it has to keep doing that.
+    /// The two-word window existed to reject prose; the duration group that
+    /// replaced it has to keep doing that. The numeric parentheticals are the
+    /// cases that matter: a bullet whose parenthetical merely starts with a
+    /// digit is the #2915 shape, and `*` / `●` are both frame chars, so
+    /// nothing else in the pipeline would reject it.
     #[test]
     fn claude_spinner_still_rejects_prose_ending_in_an_ellipsis() {
-        assert!(!claude_line_is_active_spinner(
-            "* Cooked an amazing dish today\u{2026}"
-        ));
-        assert!(!claude_line_is_active_spinner(
-            "* Cooked an amazing dish today\u{2026} (a family recipe)"
-        ));
-        assert!(!claude_line_is_active_spinner("\u{2736} Worked for 1m 52s"));
+        for line in [
+            "* Cooked an amazing dish today\u{2026}",
+            "* Cooked an amazing dish today\u{2026} (a family recipe)",
+            "* Wire the detector into the reconciler\u{2026} (2 call sites)",
+            "* Backfill the fixtures\u{2026} (3 panes)",
+            "\u{25cf} Summarized the three findings\u{2026} (1 blocker, 2 nits)",
+            "\u{25cf} Done for now\u{2026} (14:32)",
+            "\u{2736} Worked for 1m 52s",
+        ] {
+            assert!(!claude_line_is_active_spinner(line), "{line}");
+        }
     }
 
+    /// #2915: a parked pane whose transcript happens to hold bullets like the
+    /// above must stay Idle. `reconcile_claude_idle_hook_status` upgrades an
+    /// explicit `idle` hook write on this predicate, so a false match here
+    /// pins the session on Running until the text scrolls out of the window.
+    #[test]
+    fn claude_prose_bullets_do_not_pin_a_parked_pane_on_running() {
+        let pane = "\
+\u{25cf} Done. Remaining work:
+  * Wire the detector into the reconciler\u{2026} (2 call sites)
+  * Backfill the fixtures\u{2026} (3 panes)
+\u{276f}
+  ? for shortcuts
+";
+        assert_eq!(detect_claude_status(pane), Status::Idle);
+    }
+
+    /// A parenthetical inside the phrase must not shadow the real group.
+    #[test]
+    fn claude_spinner_takes_the_last_group_not_the_first() {
+        assert!(claude_line_is_active_spinner(
+            "\u{2722} Compacting conversation (auto)\u{2026} (17s)"
+        ));
+    }
+
+    /// The first two are already in this file's fixtures at the time of
+    /// writing (`53s \u{b7} \u{2193} 7.0k tokens`, `90s \u{b7} \u{2193} 4.1k tokens`),
+    /// i.e. the integer-only rule was rejecting counters the suite itself
+    /// carries, not only ones observed elsewhere.
     #[test]
     fn claude_token_counter_accepts_decimal_and_magnitude_suffixes() {
+        assert!(has_claude_live_token_counter(
+            "(53s \u{b7} \u{2193} 7.0k tokens)"
+        ));
+        assert!(has_claude_live_token_counter(
+            "(90s \u{b7} \u{2193} 4.1k tokens)"
+        ));
         assert!(has_claude_live_token_counter(
             "(22m 8s \u{b7} \u{2193} 44.7k tokens)"
         ));
@@ -2452,7 +2515,7 @@ enter to select · esc to cancel";
         ));
     }
 
-    /// #2909: the frozen background-agents strip carries the same counter
+    /// #2915: the frozen background-agents strip carries the same counter
     /// shape without the closing paren, and must stay rejected now that the
     /// count itself is no longer restricted to a plain integer.
     #[test]
